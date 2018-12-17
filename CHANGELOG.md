@@ -1,5 +1,28 @@
 ## unreleased
 
+## v0.4.0 - 2018.11.26
+
+* Add CSI Snapshots functionality
+  [[GH-103]](https://github.com/digitalocean/csi-digitalocean/pull/103)
+* Add csi-snapshotter sidecars and associated RBAC rules
+  [[GH-104]](https://github.com/digitalocean/csi-digitalocean/pull/104)
+* Add VolumeSnapshot CRD's to simplify the driver installation
+  [[GH-108]](https://github.com/digitalocean/csi-digitalocean/pull/108)
+* Revisit existing RBAC rules for the attacher, provisioner and
+  driver-registrar. We no longer use the system cluster-role bindings as those
+  will be deleted in v1.13
+  [[GH-104]](https://github.com/digitalocean/csi-digitalocean/pull/104)
+* Fix inconsistent usage of the driver name
+  [[GH-100]](https://github.com/digitalocean/csi-digitalocean/pull/100)
+* Use publish_info in ControllerPublishVolume for storing and accessing the
+  volume name on Node plugins. This allows us to do all Node related operations
+  without relying on the DO API.
+  [[GH-99]](https://github.com/digitalocean/csi-digitalocean/pull/99)
+* Improve creating volumes by validating the storage size requirements stricter
+  and returning more human friendly errors.
+  [[GH-101]](https://github.com/digitalocean/csi-digitalocean/pull/101)
+
+
 ## v0.3.1 - 2018.10.31
 
 * Fix driver name in CSIDriver, StorageClass and GetNodeInfo()

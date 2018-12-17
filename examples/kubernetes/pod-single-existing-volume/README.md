@@ -19,7 +19,7 @@ error if the volume is attached to a wrong droplet.
 To use an existing volume, we have to create manually a `PersistentVolume` (PV)
 resource. Here is an example `PersistenVolume` resource for an existing volume:
 
-```
+```yaml
 kind: PersistentVolume
 apiVersion: v1
 metadata:
@@ -27,7 +27,7 @@ metadata:
   annotations:
     # fake it by indicating this is provisioned dynamically, so the system
     # works properly
-    pv.kubernetes.io/provisioned-by: com.digitalocean.csi.dobs
+    pv.kubernetes.io/provisioned-by: dobs.csi.digitalocean.com
 spec:
   storageClassName: do-block-storage
   # by default, the volume will be not deleted if you delete the PVC, change to
@@ -38,7 +38,7 @@ spec:
   accessModes:
     - ReadWriteOnce
   csi:
-    driver: com.digitalocean.csi.dobs
+    driver: dobs.csi.digitalocean.com
     fsType: ext4
     volumeHandle: 1952d58a-c714-11e8-bc0c-0a58ac14421e
     volumeAttributes:
@@ -70,7 +70,7 @@ The status is `Available`. This means it has not yet been bound to a
 PersistentVolumeClaim. Now we can proceed to create our PVC:
 
 
-```
+```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -108,7 +108,7 @@ As you see, the output shows that the PVC is bound to our PersistentVolume, `vol
 
 Finally, define your pod that refers to this PVC:
 
-```
+```yaml
 kind: Pod
 apiVersion: v1
 metadata:

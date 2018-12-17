@@ -18,7 +18,6 @@ package driver
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -41,8 +40,23 @@ const (
 )
 
 const (
-	defaultVolumeSizeInGB = 16 * GB
+	// PublishInfoVolumeName is used to pass the volume name from
+	// `ControllerPublishVolume` to `NodeStageVolume or `NodePublishVolume`
+	PublishInfoVolumeName = DriverName + "/volume-name"
 
+	// minimumVolumeSizeInBytes is used to validate that the user is not trying
+	// to create a volume that is smaller than what we support
+	minimumVolumeSizeInBytes int64 = 1 * GB
+
+	// maximumVolumeSizeInBytes is used to validate that the user is not trying
+	// to create a volume that is larger than what we support
+	maximumVolumeSizeInBytes int64 = 16 * TB
+
+	// defaultVolumeSizeInBytes is used when the user did not provide a size or
+	// the size they provided did not satisfy our requirements
+	defaultVolumeSizeInBytes int64 = 16 * GB
+
+	// createdByDO is used to tag volumes that are created by this CSI plugin
 	createdByDO = "Created by DigitalOcean CSI driver"
 )
 
@@ -66,6 +80,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Volume capabilities must be provided")
 	}
 
+	if !validateCapabilities(req.VolumeCapabilities) {
+		return nil, status.Error(codes.InvalidArgument, "invalid volume capabilities requested. Only SINGLE_NODE_WRITER is supported ('accessModes.ReadWriteOnce' on Kubernetes)")
+	}
+
+	size, err := extractStorage(req.CapacityRange)
+	if err != nil {
+		return nil, status.Errorf(codes.OutOfRange, "invalid capacity range: %v", err)
+	}
+
 	if req.AccessibilityRequirements != nil {
 		for _, t := range req.AccessibilityRequirements.Requisite {
 			region, ok := t.Segments["region"]
@@ -75,14 +98,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 			if region != d.region {
 				return nil, status.Errorf(codes.ResourceExhausted, "volume can be only created in region: %q, got: %q", d.region, region)
-
 			}
 		}
-	}
-
-	size, err := extractStorage(req.CapacityRange)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	volumeName := req.Name
@@ -96,7 +113,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	ll.Info("create volume called")
 
 	// get volume first, if it's created do no thing
-	volumes, _, err := d.doClient.Storage.ListVolumes(ctx, &godo.ListVolumeParams{
+	volumes, _, err := d.storage.ListVolumes(ctx, &godo.ListVolumeParams{
 		Region: d.region,
 		Name:   volumeName,
 	})
@@ -131,17 +148,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		SizeGigaBytes: size / GB,
 	}
 
-	if !validateCapabilities(req.VolumeCapabilities) {
-		return nil, status.Error(codes.AlreadyExists, "invalid volume capabilities requested. Only SINGLE_NODE_WRITER is supported ('accessModes.ReadWriteOnce' on Kubernetes)")
-	}
-
 	ll.Info("checking volume limit")
 	if err := d.checkLimit(ctx); err != nil {
 		return nil, err
 	}
 
 	ll.WithField("volume_req", volumeReq).Info("creating volume")
-	vol, _, err := d.doClient.Storage.CreateVolume(ctx, volumeReq)
+	vol, _, err := d.storage.CreateVolume(ctx, volumeReq)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -176,7 +189,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	})
 	ll.Info("delete volume called")
 
-	resp, err := d.doClient.Storage.DeleteVolume(ctx, req.VolumeId)
+	resp, err := d.storage.DeleteVolume(ctx, req.VolumeId)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			// we assume it's deleted already for idempotency
@@ -231,7 +244,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	ll.Info("controller publish volume called")
 
 	// check if volume exist before trying to attach it
-	vol, resp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+	vol, resp, err := d.storage.GetVolume(ctx, req.VolumeId)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
@@ -240,7 +253,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	}
 
 	// check if droplet exist before trying to attach the volume to the droplet
-	_, resp, err = d.doClient.Droplets.Get(ctx, dropletID)
+	_, resp, err = d.droplets.Get(ctx, dropletID)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, status.Errorf(codes.NotFound, "droplet %q not found", dropletID)
@@ -253,7 +266,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		attachedID = id
 		if id == dropletID {
 			ll.Info("volume is already attached")
-			return &csi.ControllerPublishVolumeResponse{}, nil
+			return &csi.ControllerPublishVolumeResponse{
+				PublishInfo: map[string]string{
+					PublishInfoVolumeName: vol.Name,
+				},
+			}, nil
 		}
 	}
 
@@ -264,7 +281,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	}
 
 	// attach the volume to the correct node
-	action, resp, err := d.doClient.StorageActions.Attach(ctx, req.VolumeId, dropletID)
+	action, resp, err := d.storageActions.Attach(ctx, req.VolumeId, dropletID)
 	if err != nil {
 		// don't do anything if attached
 		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
@@ -273,7 +290,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 					"error": err,
 					"resp":  resp,
 				}).Warn("assuming volume is attached already")
-				return &csi.ControllerPublishVolumeResponse{}, nil
+				return &csi.ControllerPublishVolumeResponse{
+					PublishInfo: map[string]string{
+						PublishInfoVolumeName: vol.Name,
+					},
+				}, nil
 			}
 
 			if strings.Contains(err.Error(), "Droplet already has a pending event") {
@@ -297,7 +318,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	}
 
 	ll.Info("volume is attached")
-	return &csi.ControllerPublishVolumeResponse{}, nil
+	return &csi.ControllerPublishVolumeResponse{
+		PublishInfo: map[string]string{
+			PublishInfoVolumeName: vol.Name,
+		},
+	}, nil
 }
 
 // ControllerUnpublishVolume deattaches the given volume from the node
@@ -322,7 +347,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	ll.Info("controller unpublish volume called")
 
 	// check if volume exist before trying to detach it
-	_, resp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+	_, resp, err := d.storage.GetVolume(ctx, req.VolumeId)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			// assume it's detached
@@ -332,7 +357,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	}
 
 	// check if droplet exist before trying to detach the volume from the droplet
-	_, resp, err = d.doClient.Droplets.Get(ctx, dropletID)
+	_, resp, err = d.droplets.Get(ctx, dropletID)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, status.Errorf(codes.NotFound, "droplet %q not found", dropletID)
@@ -340,7 +365,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 		return nil, err
 	}
 
-	action, resp, err := d.doClient.StorageActions.DetachByDropletID(ctx, req.VolumeId, dropletID)
+	action, resp, err := d.storageActions.DetachByDropletID(ctx, req.VolumeId, dropletID)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
 			if strings.Contains(err.Error(), "Attachment not found") {
@@ -396,7 +421,7 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 	ll.Info("validate volume capabilities called")
 
 	// check if volume exist before trying to validate it it
-	_, volResp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+	_, volResp, err := d.storage.GetVolume(ctx, req.VolumeId)
 	if err != nil {
 		if volResp != nil && volResp.StatusCode == http.StatusNotFound {
 			return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
@@ -459,7 +484,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	var volumes []godo.Volume
 	lastPage := 0
 	for {
-		vols, resp, err := d.doClient.Storage.ListVolumes(ctx, listOpts)
+		vols, resp, err := d.storage.ListVolumes(ctx, listOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -528,16 +553,13 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 		}
 	}
 
-	// TODO(arslan): checkout if the capabilities are worth supporting
 	var caps []*csi.ControllerServiceCapability
 	for _, cap := range []csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
-
-		// TODO(arslan): enable once snapshotting is supported
-		// csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-		// csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 	} {
 		caps = append(caps, newCap(cap))
 	}
@@ -556,20 +578,101 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 // CreateSnapshot will be called by the CO to create a new snapshot from a
 // source volume on behalf of a user.
 func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	d.log.WithFields(logrus.Fields{
-		"req":    req,
-		"method": "create_snapshot",
-	}).Warn("create snapshot is not implemented")
-	return nil, status.Error(codes.Unimplemented, "")
+	if req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Name must be provided")
+	}
+
+	if req.GetSourceVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")
+	}
+
+	ll := d.log.WithFields(logrus.Fields{
+		"req_name":             req.GetName(),
+		"req_source_volume_id": req.GetSourceVolumeId(),
+		"req_parameters":       req.GetParameters(),
+		"method":               "create_snapshot",
+	})
+
+	ll.Info("create snapshot is called")
+
+	// get snapshot first, if it's created do no thing
+	snapshots, _, err := d.storage.ListSnapshots(ctx, req.GetSourceVolumeId(), nil)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "couldn't fetch snapshots: %s", err.Error())
+	}
+
+	for _, snap := range snapshots {
+		if snap.Name == req.GetName() && snap.ResourceID == req.GetSourceVolumeId() {
+			s, err := toCSISnapshot(&snap)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal,
+					"couldn't convert DO snapshot to CSI snapshot: %s", err.Error())
+			}
+
+			return &csi.CreateSnapshotResponse{
+				Snapshot: s,
+			}, nil
+		}
+	}
+
+	snap, resp, err := d.storage.CreateSnapshot(ctx, &godo.SnapshotCreateRequest{
+		VolumeID:    req.GetSourceVolumeId(),
+		Name:        req.GetName(),
+		Description: createdByDO,
+	})
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusConflict {
+			// 409 is returned when we try to snapshot a volume with the same
+			// name
+			ll.WithFields(logrus.Fields{
+				"error": err,
+				"resp":  resp,
+			}).Warn("snapshot create failed, might be due using an existing name")
+			return nil, status.Errorf(codes.AlreadyExists, "snapshot with name %s already exists", req.GetName())
+		}
+
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	s, err := toCSISnapshot(snap)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"couldn't convert DO snapshot to CSI snapshot: %s", err.Error())
+	}
+
+	return &csi.CreateSnapshotResponse{
+		Snapshot: s,
+	}, nil
 }
 
 // DeleteSnapshost will be called by the CO to delete a snapshot.
 func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	d.log.WithFields(logrus.Fields{
-		"req":    req,
-		"method": "delete_snapshot",
-	}).Warn("delete snapshot is not implemented")
-	return nil, status.Error(codes.Unimplemented, "")
+	ll := d.log.WithFields(logrus.Fields{
+		"req_snapshot_id": req.GetSnapshotId(),
+		"method":          "delete_snapshot",
+	})
+
+	ll.Info("delete snapshot is called")
+
+	if req.GetSnapshotId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "DeleteSnapshot Snapshot ID must be provided")
+	}
+
+	resp, err := d.storage.DeleteSnapshot(ctx, req.GetSnapshotId())
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			// we assume it's deleted already for idempotency
+			ll.WithFields(logrus.Fields{
+				"error": err,
+				"resp":  resp,
+			}).Warn("assuming snapshot is deleted already")
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+		return nil, err
+	}
+
+	ll.WithField("response", resp).Info("snapshot is deleted")
+	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 // ListSnapshots returns the information about all snapshots on the storage
@@ -577,38 +680,174 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 // ListSnapshots shold not list a snapshot that is being created but has not
 // been cut successfully yet.
 func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
-	d.log.WithFields(logrus.Fields{
-		"req":    req,
-		"method": "list_snapshots",
-	}).Warn("list snapshots is not implemented")
-	return nil, status.Error(codes.Unimplemented, "")
+	// Pagination in the CSI world works different than at DO. CSI sends the
+	// `req.MaxEntries` to indicate how much snapshots it wants. The
+	// req.StartingToken is returned by us, if we somehow need to indicate that
+	// we couldn't fetch and need to fetch again. But it's NOT the page number.
+	// I.e: suppose CSI wants us to fetch 50 entries, we only fetch 30, we need to
+	// return NextToken as 31 (so req.StartingToken will be set to 31 when CSI
+	// calls us again), to indicate that we want to continue returning from the
+	// index 31 up to 50.
+
+	var nextToken int
+	var err error
+	if req.StartingToken != "" {
+		nextToken, err = strconv.Atoi(req.StartingToken)
+		if err != nil {
+			return nil, status.Errorf(codes.Aborted, "ListSnapshots starting token %s is not valid : %s",
+				req.StartingToken, err.Error())
+		}
+	}
+
+	if nextToken != 0 && req.MaxEntries != 0 {
+		return nil, status.Errorf(codes.Aborted,
+			"ListSnapshots invalid arguments starting token: %d and max entries: %d can't be non null at the same time", nextToken, req.MaxEntries)
+	}
+
+	ll := d.log.WithFields(logrus.Fields{
+		"req_starting_token": req.StartingToken,
+		"method":             "list_snapshots",
+	})
+	ll.Info("list snapshots is called")
+
+	// fetch all entries
+	listOpts := &godo.ListOptions{
+		PerPage: int(req.MaxEntries),
+	}
+	var snapshots []godo.Snapshot
+	for {
+		snaps, resp, err := d.snapshots.ListVolume(ctx, listOpts)
+		if err != nil {
+			return nil, status.Errorf(codes.Aborted, "ListSnapshots listing volume snapshots has failed: %s", err.Error())
+		}
+
+		snapshots = append(snapshots, snaps...)
+
+		if resp.Links == nil || resp.Links.IsLastPage() {
+			break
+		}
+
+		page, err := resp.Links.CurrentPage()
+		if err != nil {
+			return nil, err
+		}
+
+		listOpts.Page = page + 1
+		listOpts.PerPage = len(snaps)
+	}
+
+	if nextToken > len(snapshots) {
+		return nil, status.Error(codes.Aborted, "ListSnapshots starting token is greater than total number of snapshots")
+	}
+
+	if nextToken != 0 {
+		snapshots = snapshots[nextToken:]
+	}
+
+	if req.MaxEntries != 0 {
+		nextToken = len(snapshots) - int(req.MaxEntries) - 1
+		snapshots = snapshots[:req.MaxEntries]
+	}
+
+	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		snap, err := toCSISnapshot(&snapshot)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"couldn't convert DO snapshot to CSI snapshot: %s", err.Error())
+		}
+
+		entries = append(entries, &csi.ListSnapshotsResponse_Entry{
+			Snapshot: snap,
+		})
+	}
+
+	listResp := &csi.ListSnapshotsResponse{
+		Entries:   entries,
+		NextToken: strconv.Itoa(nextToken),
+	}
+
+	ll.WithField("response", listResp).Info("snapshots listed")
+	return listResp, nil
 }
 
-// extractStorage extracts the storage size in GB from the given capacity
+// extractStorage extracts the storage size in bytes from the given capacity
 // range. If the capacity range is not satisfied it returns the default volume
-// size.
+// size. If the capacity range is below or above supported sizes, it returns an
+// error.
 func extractStorage(capRange *csi.CapacityRange) (int64, error) {
 	if capRange == nil {
-		return defaultVolumeSizeInGB, nil
+		return defaultVolumeSizeInBytes, nil
 	}
 
-	if capRange.RequiredBytes == 0 && capRange.LimitBytes == 0 {
-		return defaultVolumeSizeInGB, nil
+	requiredBytes := capRange.GetRequiredBytes()
+	requiredSet := 0 < requiredBytes
+	limitBytes := capRange.GetLimitBytes()
+	limitSet := 0 < limitBytes
+
+	if !requiredSet && !limitSet {
+		return defaultVolumeSizeInBytes, nil
 	}
 
-	minSize := capRange.RequiredBytes
-
-	// limitBytes might be zero
-	maxSize := capRange.LimitBytes
-	if capRange.LimitBytes == 0 {
-		maxSize = minSize
+	if requiredSet && limitSet && limitBytes < requiredBytes {
+		return 0, fmt.Errorf("limit (%v) can not be less than required (%v) size", formatBytes(limitBytes), formatBytes(requiredBytes))
 	}
 
-	if minSize == maxSize {
-		return minSize, nil
+	if requiredSet && !limitSet && requiredBytes < minimumVolumeSizeInBytes {
+		return 0, fmt.Errorf("required (%v) can not be less than minimum supported volume size (%v)", formatBytes(requiredBytes), formatBytes(minimumVolumeSizeInBytes))
 	}
 
-	return 0, errors.New("requiredBytes and LimitBytes are not the same")
+	if limitSet && limitBytes < minimumVolumeSizeInBytes {
+		return 0, fmt.Errorf("limit (%v) can not be less than minimum supported volume size (%v)", formatBytes(limitBytes), formatBytes(minimumVolumeSizeInBytes))
+	}
+
+	if requiredSet && requiredBytes > maximumVolumeSizeInBytes {
+		return 0, fmt.Errorf("required (%v) can not exceed maximum supported volume size (%v)", formatBytes(requiredBytes), formatBytes(maximumVolumeSizeInBytes))
+	}
+
+	if !requiredSet && limitSet && limitBytes > maximumVolumeSizeInBytes {
+		return 0, fmt.Errorf("limit (%v) can not exceed maximum supported volume size (%v)", formatBytes(limitBytes), formatBytes(maximumVolumeSizeInBytes))
+	}
+
+	if requiredSet && limitSet && requiredBytes == limitBytes {
+		return requiredBytes, nil
+	}
+
+	if requiredSet {
+		return requiredBytes, nil
+	}
+
+	if limitSet {
+		return limitBytes, nil
+	}
+
+	return defaultVolumeSizeInBytes, nil
+}
+
+func formatBytes(inputBytes int64) string {
+	output := float64(inputBytes)
+	unit := ""
+
+	switch {
+	case inputBytes >= TB:
+		output = output / TB
+		unit = "Ti"
+	case inputBytes >= GB:
+		output = output / GB
+		unit = "Gi"
+	case inputBytes >= MB:
+		output = output / MB
+		unit = "Mi"
+	case inputBytes >= KB:
+		output = output / KB
+		unit = "Ki"
+	case inputBytes == 0:
+		return "0"
+	}
+
+	result := strconv.FormatFloat(output, 'f', 1, 64)
+	result = strings.TrimSuffix(result, ".0")
+	return result + unit
 }
 
 // waitAction waits until the given action for the volume is completed
@@ -627,7 +866,7 @@ func (d *Driver) waitAction(ctx context.Context, volumeId string, actionId int) 
 	for {
 		select {
 		case <-ticker.C:
-			action, _, err := d.doClient.StorageActions.Get(ctx, volumeId, actionId)
+			action, _, err := d.storageActions.Get(ctx, volumeId, actionId)
 			if err != nil {
 				ll.WithError(err).Info("waiting for volume errored")
 				continue
@@ -654,7 +893,7 @@ func (d *Driver) checkLimit(ctx context.Context) error {
 	d.readyMu.Lock()
 	defer d.readyMu.Unlock()
 
-	account, _, err := d.doClient.Account.Get(ctx)
+	account, _, err := d.account.Get(ctx)
 	if err != nil {
 		return status.Errorf(codes.Internal,
 			"couldn't get account information to check volume limit: %s", err.Error())
@@ -668,7 +907,7 @@ func (d *Driver) checkLimit(ctx context.Context) error {
 	// NOTE(arslan): the API returns the limit for *all* regions, so passing
 	// the region down as a parameter doesn't change the response.
 	// Nevertheless, this is something we should be aware of.
-	volumes, _, err := d.doClient.Storage.ListVolumes(ctx, &godo.ListVolumeParams{
+	volumes, _, err := d.storage.ListVolumes(ctx, &godo.ListVolumeParams{
 		Region: d.region,
 	})
 	if err != nil {
@@ -683,6 +922,24 @@ func (d *Driver) checkLimit(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// toCSISnapshot converts a DO Snapshot struct into a csi.Snapshot struct
+func toCSISnapshot(snap *godo.Snapshot) (*csi.Snapshot, error) {
+	createdAt, err := time.Parse(time.RFC3339, snap.Created)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't parse snapshot's created field: %s", err.Error())
+	}
+
+	return &csi.Snapshot{
+		Id:             snap.ID,
+		SourceVolumeId: snap.ResourceID,
+		SizeBytes:      int64(snap.SizeGigaBytes) * GB,
+		CreatedAt:      createdAt.UTC().UnixNano(),
+		Status: &csi.SnapshotStatus{
+			Type: csi.SnapshotStatus_READY,
+		},
+	}, nil
 }
 
 // validateCapabilities validates the requested capabilities. It returns false
